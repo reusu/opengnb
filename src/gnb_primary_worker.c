@@ -322,7 +322,7 @@ static gnb_worker_queue_data_t* make_worker_send_queue_data(gnb_worker_t *worker
     return send_queue_data;
 }
 
-static void handle_udp(gnb_core_t *gnb_core, gnb_pf_core_t *pf_core, uint8_t socket_idx, int af) {
+static ssize_t handle_udp(gnb_core_t *gnb_core, gnb_pf_core_t *pf_core, uint8_t socket_idx, int af) {
     ssize_t n_recv;
     uint16_t payload_size;
     gnb_sockaddress_t node_addr_st;
@@ -339,7 +339,7 @@ static void handle_udp(gnb_core_t *gnb_core, gnb_pf_core_t *pf_core, uint8_t soc
         pf_worker = select_pf_worker(gnb_core);
         receive_queue_data = (gnb_worker_queue_data_t *)gnb_ring_buffer_fixed_push(pf_worker->ring_buffer_in);
         if ( NULL == receive_queue_data ) {
-            return;
+            return 0;
         }
         inet_payload = &receive_queue_data->data.node_in.payload_st;
     }
@@ -449,7 +449,7 @@ skip_tun:
         goto finish;
     }
 finish:
-    return;
+    return n_recv;
 }
 
 static ssize_t handle_tun(gnb_core_t *gnb_core, gnb_pf_core_t *pf_core) {
@@ -550,14 +550,24 @@ static void* udp_loop_thread_func( void *data ) {
         if ( gnb_core->conf->udp_socket_type & GNB_ADDR_TYPE_IPV6 ) {
             for ( i=0; i<gnb_core->conf->udp6_socket_num; i++ ) {
                 if ( FD_ISSET( gnb_core->udp_ipv6_sockets[i], &readfds ) ) {
-                    handle_udp(gnb_core, pf_core, i, AF_INET6);
+                    int drained = 0;
+                    while ( drained < 64 ) {
+                        ssize_t r = handle_udp(gnb_core, pf_core, i, AF_INET6);
+                        if ( r <= 0 ) break;
+                        drained++;
+                    }
                 }
             }
         }
         if ( gnb_core->conf->udp_socket_type & GNB_ADDR_TYPE_IPV4 ) {
             for ( i=0; i<gnb_core->conf->udp4_socket_num; i++ ) {
                 if ( FD_ISSET( gnb_core->udp_ipv4_sockets[i], &readfds ) ) {
-                    handle_udp(gnb_core, pf_core, i, AF_INET);
+                    int drained = 0;
+                    while ( drained < 64 ) {
+                        ssize_t r = handle_udp(gnb_core, pf_core, i, AF_INET);
+                        if ( r <= 0 ) break;
+                        drained++;
+                    }
                 }
             }
         }
@@ -583,8 +593,36 @@ static void* tun_loop_thread_func(void *data) {
     gnb_core_t *gnb_core = primary_worker_ctx->gnb_core;
     gnb_pf_core_t *pf_core = primary_worker_ctx->pf_core;
     gnb_core->loop_flag = 1;
+
+    /* 将 TUN fd 设为非阻塞,配合 select + drain 循环批量读 */
+    int tun_flags = fcntl(gnb_core->tun_fd, F_GETFL, 0);
+    if ( tun_flags >= 0 ) {
+        fcntl(gnb_core->tun_fd, F_SETFL, tun_flags | O_NONBLOCK);
+    }
+
+    fd_set readfds;
+    struct timeval timeout;
+
     while ( gnb_core->loop_flag ) {
-        handle_tun(gnb_core, pf_core);
+        FD_ZERO(&readfds);
+        FD_SET(gnb_core->tun_fd, &readfds);
+        timeout.tv_sec  = 1;
+        timeout.tv_usec = 0;
+        int n_ready = select(gnb_core->tun_fd + 1, &readfds, NULL, NULL, &timeout);
+        if ( n_ready < 0 ) {
+            if ( EINTR == errno ) continue;
+            break;
+        }
+        if ( n_ready == 0 ) continue;   /* 超时,没包可读 */
+        if ( !FD_ISSET(gnb_core->tun_fd, &readfds) ) continue;
+
+        /* drain: 一次唤醒把 TUN ring 里的包全处理完,最多 64 个避免饿死 */
+        int drained = 0;
+        while ( drained < 64 ) {
+            ssize_t r = handle_tun(gnb_core, pf_core);
+            if ( r <= 0 ) break;   /* EAGAIN 或其他返回 0/负数 */
+            drained++;
+        }
     }
     return NULL;
 }
@@ -640,14 +678,24 @@ static void* udp_loop_thread_func(void *data) {
         if ( gnb_core->conf->udp_socket_type & GNB_ADDR_TYPE_IPV6 ) {
             for ( i=0; i < gnb_core->conf->udp6_socket_num; i++ ) {
                 if ( FD_ISSET( gnb_core->udp_ipv6_sockets[i], &readfds ) ) {
-                    handle_udp(gnb_core, pf_core, i, AF_INET6);
+                    int drained = 0;
+                    while ( drained < 64 ) {
+                        ssize_t r = handle_udp(gnb_core, pf_core, i, AF_INET6);
+                        if ( r <= 0 ) break;
+                        drained++;
+                    }
                 }
             }
         }
         if ( gnb_core->conf->udp_socket_type & GNB_ADDR_TYPE_IPV4 ) {
             for ( i=0; i < gnb_core->conf->udp4_socket_num; i++ ) {
                 if ( FD_ISSET( gnb_core->udp_ipv4_sockets[i], &readfds ) ) {
-                    handle_udp(gnb_core, pf_core, i, AF_INET);
+                    int drained = 0;
+                    while ( drained < 64 ) {
+                        ssize_t r = handle_udp(gnb_core, pf_core, i, AF_INET);
+                        if ( r <= 0 ) break;
+                        drained++;
+                    }
                 }
             }
         }
@@ -690,7 +738,7 @@ static void init(gnb_worker_t *gnb_worker, void *ctx) {
     gnb_pf_install(pf_core->pf_install_array, pf);
     if ( 0 != gnb_core->conf->zip_level ) {
         pf = gnb_find_pf_mod_by_name("gnb_pf_zip");
-        gnb_pf_install(pf_core->pf_install_array, pf);        
+        gnb_pf_install(pf_core->pf_install_array, pf);
     }
     if ( !(GNB_PF_BITS_CRYPTO_XOR & gnb_core->conf->pf_bits) && !(GNB_PF_BITS_CRYPTO_ARC4 & gnb_core->conf->pf_bits) ) {
         goto skip_crypto;

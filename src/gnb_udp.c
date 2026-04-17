@@ -37,6 +37,33 @@
 
 #include "gnb_udp.h"
 
+/*
+ * 调节 UDP socket 的性能参数:
+ *   - 扩大 SO_RCVBUF/SO_SNDBUF，避免在突发流量下内核丢包
+ *   - 非 Windows 平台设置 O_NONBLOCK，让上层可以做 drain 式批量读
+ *
+ * 注意: 需要内核允许这么大的缓冲区,参考:
+ *   sysctl -w net.core.rmem_max=33554432
+ *   sysctl -w net.core.wmem_max=33554432
+ */
+static void gnb_tune_udp_socket(int socketfd) {
+    int bufsize = 8 * 1024 * 1024;   /* 8MB */
+    setsockopt(socketfd, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
+    setsockopt(socketfd, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
+
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__)
+    int flags = fcntl(socketfd, F_GETFL, 0);
+    if ( flags >= 0 ) {
+        fcntl(socketfd, F_SETFL, flags | O_NONBLOCK);
+    }
+#endif
+
+#ifdef _WIN32
+    u_long nonblock = 1;
+    ioctlsocket(socketfd, FIONBIO, &nonblock);
+#endif
+}
+
 int gnb_bind_udp_socket_ipv4(int socketfd,const char *host, int port) {
     struct sockaddr_in svr_addr;
     memset(&svr_addr, 0, sizeof(struct sockaddr_in));
@@ -55,6 +82,10 @@ int gnb_bind_udp_socket_ipv4(int socketfd,const char *host, int port) {
         perror("bind");
         return -1;
     }
+
+    /* 扩大缓冲区 + 非阻塞 */
+    gnb_tune_udp_socket(socketfd);
+
     return 0;
 }
 
@@ -80,5 +111,9 @@ int gnb_bind_udp_socket_ipv6(int socketfd,const char *host, int port) {
         perror("bind");
         return -1;
     }
+
+    /* 扩大缓冲区 + 非阻塞 */
+    gnb_tune_udp_socket(socketfd);
+
     return 0;
 }
